@@ -1,136 +1,138 @@
-// services/geminiService.js
+const Groq = require('groq-sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+// ── Initialize both APIs ──────────────────────────────────────
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// ═══════════════════════════════════════════
-// gemini-2.0-flash (1.5-flash-latest is DEPRECATED)
-// ═══════════════════════════════════════════
-const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+// ── Helper — JSON extract karo response se ────────────────────
+function extractJSON(text) {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('No JSON found in response');
+  return JSON.parse(match[0]);
+}
 
-// Helper: delay
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// ── Groq se decision lo ───────────────────────────────────────
+async function analyzeWithGroq(symbol, buyPrice, currentPrice, targetProfitPercent, maxDays, targetSellPrice, profitPercent) {
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [{
+      role: 'user',
+      content: `You are an expert stock trading analyst. Make a SELL or HOLD decision.
 
-// Helper: retry with backoff
-const callGeminiWithRetry = async (prompt, maxRetries = 2) => {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      if (attempt > 1) {
-        const waitTime = attempt * 2000;
-        console.log(`[AI] ⏳ Retry ${attempt}/${maxRetries} — waiting ${waitTime / 1000}s...`);
-        await delay(waitTime);
-      }
+      Stock Symbol     : ${symbol}
+      Buy Price        : ₹${buyPrice}
+      Current Price    : ₹${currentPrice}
+      Target Sell Price: ₹${targetSellPrice} (${targetProfitPercent}% target profit)
+      Current P&L      : ${profitPercent}% profit
+      Max Holding Days : ${maxDays}
 
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      return response.text().trim();
-    } catch (error) {
-      const status = error?.status || error?.httpStatusCode;
-      if (status === 429 || error?.message?.includes('429')) {
-        console.warn(`[AI] ⚠️ Rate limited (attempt ${attempt}/${maxRetries})`);
-        if (attempt === maxRetries) throw new Error('Gemini rate limit exceeded after retries');
-        await delay(15000); // Wait 15 seconds on rate limit
-      } else {
-        throw error;
-      }
-    }
-  }
-};
+      RULE: If Current Price >= Target Sell Price, you MUST recommend SELL.
+      Current price ₹${currentPrice} is ${parseFloat(profitPercent) >= 0 ? 'above' : 'below'} buy price by ${Math.abs(profitPercent)}%.
 
-// ═══════════════════════════════════════════
-// AI Decision: SELL or HOLD
-// ═══════════════════════════════════════════
-const getAIDecision = async ({ symbol, buyPrice, currentPrice, targetSellPrice, profitPercent, daysHeld, maxDays }) => {
+      Reply ONLY in this exact JSON format, no extra text:
+      {
+        "action": "SELL" or "HOLD",
+        "reason": "one clear sentence explaining why",
+        "confidence": "HIGH" or "MEDIUM" or "LOW",
+        "riskLevel": "HIGH" or "MEDIUM" or "LOW"
+      }`
+    }],
+    temperature: 0.3,
+    max_tokens: 200,
+  });
+
+  const text = completion.choices[0].message.content;
+  return extractJSON(text);
+}
+
+// ── Gemini se decision lo ─────────────────────────────────────
+async function analyzeWithGemini(symbol, buyPrice, currentPrice, targetProfitPercent, maxDays, targetSellPrice, profitPercent) {
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-lite' });
+
+  const prompt = `You are an expert stock trading analyst. Make a SELL or HOLD decision.
+
+  Stock Symbol     : ${symbol}
+  Buy Price        : ₹${buyPrice}
+  Current Price    : ₹${currentPrice}
+  Target Sell Price: ₹${targetSellPrice} (${targetProfitPercent}% target profit)
+  Current P&L      : ${profitPercent}% profit
+  Max Holding Days : ${maxDays}
+
+  RULE: If Current Price >= Target Sell Price, you MUST recommend SELL.
+
+  Reply ONLY in this exact JSON format, no extra text:
+  {
+    "action": "SELL" or "HOLD",
+    "reason": "one clear sentence explaining why",
+    "confidence": "HIGH" or "MEDIUM" or "LOW",
+    "riskLevel": "HIGH" or "MEDIUM" or "LOW"
+  }`;
+
+  const result = await model.generateContent(prompt);
+  const text = result.response.text();
+  return extractJSON(text);
+}
+
+// ── Main Function — Groq first, Gemini fallback ───────────────
+async function analyzeStock(symbol, buyPrice, currentPrice, targetProfitPercent, maxDays, targetSellPrice, profitPercent) {
+  // Try 1 — Groq (fast + no rate limit)
   try {
-    const prompt = `You are a stock trading AI assistant. Analyze this trade and give a decision.
-
-Stock: ${symbol}
-Buy Price: ₹${buyPrice}
-Current Price: ₹${currentPrice}
-Target Sell Price: ₹${targetSellPrice}
-Current Profit: ${profitPercent}%
-Days Held: ${daysHeld} / ${maxDays} max days
-
-Rules:
-1. If current price >= target sell price, recommend SELL
-2. If current price is very close to target (within 0.2%), recommend SELL
-3. If days remaining are very few and price is near target, recommend SELL
-4. Otherwise recommend HOLD
-
-Respond in this exact JSON format only (no markdown, no code blocks):
-{"decision": "SELL" or "HOLD", "confidence": 0-100, "reasoning": "brief 1-2 sentence explanation"}`;
-
-    const text = await callGeminiWithRetry(prompt);
-    const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const parsed = JSON.parse(cleaned);
-
-    console.log(`[AI] ✅ ${symbol}: ${parsed.decision} (${parsed.confidence}% confidence)`);
-    return parsed;
-  } catch (error) {
-    console.error(`[AI] ❌ Decision error for ${symbol}:`, error.message);
-    const fallback = currentPrice >= targetSellPrice ? 'SELL' : 'HOLD';
-    return {
-      decision: fallback,
-      confidence: 70,
-      reasoning: `AI unavailable — fallback: price ${currentPrice >= targetSellPrice ? 'exceeded' : 'below'} target.`,
-    };
+    const decision = await analyzeWithGroq(
+      symbol, buyPrice, currentPrice, targetProfitPercent, maxDays, targetSellPrice, profitPercent
+    );
+    console.log(`[AI] ✅ Groq decision for ${symbol}:`, decision.action);
+    return decision;
+  } catch (groqError) {
+    console.warn(`[AI] ⚠️ Groq failed for ${symbol}: ${groqError.message}`);
   }
-};
 
-// ═══════════════════════════════════════════
-// AI Drop Analysis
-// ═══════════════════════════════════════════
-const getDropAnalysis = async ({ symbol, buyPrice, currentPrice, dropPercent }) => {
+  // Try 2 — Gemini fallback
   try {
-    const prompt = `You are a stock trading AI. A stock has dropped significantly.
-
-Stock: ${symbol}
-Buy Price: ₹${buyPrice}
-Current Price: ₹${currentPrice}
-Drop: ${dropPercent}%
-
-Provide a brief analysis (2-3 sentences) on whether to hold, average down, or cut losses.
-Respond in plain text only, no JSON, no markdown.`;
-
-    const text = await callGeminiWithRetry(prompt);
-    console.log(`[AI] ✅ Drop analysis for ${symbol} generated`);
-    return text;
-  } catch (error) {
-    console.error(`[AI] ❌ Drop analysis error for ${symbol}:`, error.message);
-    return `Price dropped ${dropPercent}% below buy price. Review your position and consider your risk tolerance.`;
+    const decision = await analyzeWithGemini(
+      symbol, buyPrice, currentPrice, targetProfitPercent, maxDays, targetSellPrice, profitPercent
+    );
+    console.log(`[AI] ✅ Gemini fallback for ${symbol}:`, decision.action);
+    return decision;
+  } catch (geminiError) {
+    console.warn(`[AI] ⚠️ Gemini failed for ${symbol}: ${geminiError.message}`);
   }
-};
 
-// ═══════════════════════════════════════════
-// AI Portfolio Commentary (Daily Summary)
-// ═══════════════════════════════════════════
-const getPortfolioCommentary = async (conditions) => {
+  // Try 3 — Rule based fallback
+  console.log(`[AI] ⚠️ Both AI failed — using rule-based for ${symbol}`);
+  const fallbackAction = parseFloat(currentPrice) >= parseFloat(targetSellPrice) ? 'SELL' : 'HOLD';
+  return {
+    action: fallbackAction,
+    reason: `AI unavailable — price ${fallbackAction === 'SELL' ? 'exceeded' : 'below'} target.`,
+    confidence: 'LOW',
+    riskLevel: 'MEDIUM',
+  };
+}
+
+// ── Market Summary — Groq first, Gemini fallback ──────────────
+async function getMarketSummary(symbol, currentPrice) {
+  const prompt = `Stock ${symbol} is currently trading at ${currentPrice}. 
+  Give a brief 1-2 sentence market commentary. Be factual and concise.`;
+
+  // Try Groq first
   try {
-    const portfolio = conditions.map((c) => {
-      const pnl = c.lastCheckedPrice
-        ? (((c.lastCheckedPrice - c.buyPrice) / c.buyPrice) * 100).toFixed(2)
-        : 'N/A';
-      return `${c.symbol}: Buy ₹${c.buyPrice}, Current ₹${c.lastCheckedPrice || 'N/A'}, P&L ${pnl}%, Status ${c.status}`;
-    }).join('\n');
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 150,
+    });
+    return completion.choices[0].message.content;
+  } catch (_) { }
 
-    const prompt = `You are a portfolio analyst AI. Here is today's portfolio snapshot:
+  // Try Gemini fallback
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
+    const result = await model.generateContent(prompt);
+    return result.response.text();
+  } catch (_) { }
 
-${portfolio}
+  // Final fallback
+  return `${symbol} is currently trading at ${currentPrice}.`;
+}
 
-Provide a brief portfolio commentary (3-4 sentences). Mention overall performance, stocks needing attention, and general outlook.
-Respond in plain text only, no JSON, no markdown.`;
-
-    const text = await callGeminiWithRetry(prompt);
-    console.log(`[AI] ✅ Portfolio commentary generated`);
-    return text;
-  } catch (error) {
-    console.error(`[AI] ❌ Portfolio commentary error:`, error.message);
-    return `Portfolio has ${conditions.length} active condition(s). Review each position based on current market conditions.`;
-  }
-};
-
-module.exports = {
-  getAIDecision,
-  getDropAnalysis,
-  getPortfolioCommentary,
-};
+module.exports = { analyzeStock, getMarketSummary };

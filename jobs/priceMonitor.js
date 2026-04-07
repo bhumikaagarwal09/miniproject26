@@ -4,20 +4,15 @@ const Condition = require('../models/Condition');
 const Alert = require('../models/Alert');
 const User = require('../models/User');
 const { getStockPrice } = require('../services/stockService');
-const { getAIDecision, getDropAnalysis, getPortfolioCommentary } = require('../services/geminiService');
+const { analyzeStock, getMarketSummary } = require('../services/geminiService');
 const { sendSellAlertEmail, sendDropAlertEmail, sendDailySummaryEmail } = require('../services/emailService');
-
-// ═══════════════════════════════════════════
-// Helper: Delay to avoid Gemini 429 rate limit
-// ═══════════════════════════════════════════
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ═══════════════════════════════════════════
 // PRICE MONITOR — Every 5 minutes
 // ═══════════════════════════════════════════
 const startPriceMonitor = () => {
 
-  cron.schedule('*/2 * * * *', async () => {
+  cron.schedule('*/5 * * * *', async () => {
     const startTime = Date.now();
     console.log(`\n[Monitor] ⏱  Cron fired at ${new Date().toISOString()}`);
 
@@ -115,24 +110,21 @@ const startPriceMonitor = () => {
           if (currentPrice >= targetSellPrice) {
             console.log(`[Monitor] 🎯 ${condition.symbol}: Target reached! Asking AI...`);
 
-            // Delay before Gemini call to avoid 429
-            await delay(3000);
-
-            const aiResult = await getAIDecision({
-              symbol: condition.symbol,
-              buyPrice: condition.buyPrice,
+            const aiResult = await analyzeStock(
+              condition.symbol,
+              condition.buyPrice,
               currentPrice,
-              targetSellPrice: targetSellPrice.toFixed(2),
-              profitPercent,
-              daysHeld,
-              maxDays: condition.maxDays,
-            });
+              condition.targetProfitPercent,
+              condition.maxDays,
+              targetSellPrice.toFixed(2),
+              profitPercent
+            );
 
-            if (aiResult.decision === 'SELL') {
+            if (aiResult.action === 'SELL') {
               // Update condition → COMPLETED
               condition.status = 'COMPLETED';
               condition.completedAt = new Date();
-              condition.aiNote = `${aiResult.decision}: ${aiResult.reasoning} (Confidence: ${aiResult.confidence}%)`;
+              condition.aiNote = `${aiResult.action}: ${aiResult.reason} (Confidence: ${aiResult.confidence}, Risk: ${aiResult.riskLevel})`;
 
               // Save alert to DB
               const alert = await Alert.create({
@@ -157,7 +149,7 @@ const startPriceMonitor = () => {
                   currentPrice,
                   targetSellPrice: targetSellPrice.toFixed(2),
                   profitPercent,
-                  aiNote: aiResult.reasoning,
+                  aiNote: aiResult.reason,
                 });
 
                 alert.emailSent = emailResult.success;
@@ -170,8 +162,8 @@ const startPriceMonitor = () => {
               console.log(`[Monitor] ✅ ${condition.symbol}: COMPLETED — Profit: ${profitPercent}%`);
             } else {
               // AI says HOLD
-              condition.aiNote = `HOLD: ${aiResult.reasoning} (Confidence: ${aiResult.confidence}%)`;
-              console.log(`[Monitor] ✋ ${condition.symbol}: AI says HOLD — ${aiResult.reasoning}`);
+              condition.aiNote = `HOLD: ${aiResult.reason} (Confidence: ${aiResult.confidence})`;
+              console.log(`[Monitor] ✋ ${condition.symbol}: AI says HOLD — ${aiResult.reason}`);
             }
           }
 
@@ -184,15 +176,8 @@ const startPriceMonitor = () => {
             if (parseFloat(dropPercent) >= 3 && !condition.dropAlertSent) {
               console.log(`[Monitor] 🔴 ${condition.symbol}: Dropped ${dropPercent}% below buyPrice!`);
 
-              // Delay before Gemini call
-              await delay(3000);
-
-              const dropAnalysis = await getDropAnalysis({
-                symbol: condition.symbol,
-                buyPrice: condition.buyPrice,
-                currentPrice,
-                dropPercent,
-              });
+              // ⚡ No Gemini call here — conserving the 20 RPD daily quota for SELL decisions only
+              const dropAnalysis = `${condition.symbol} has dropped ${dropPercent}% below your buy price of ₹${condition.buyPrice}. Current price: ₹${currentPrice}. Review your position and consider your risk tolerance before averaging down or cutting losses.`;
 
               // Save DROP alert
               const dropAlert = await Alert.create({
@@ -239,10 +224,7 @@ const startPriceMonitor = () => {
         // Save all condition updates
         await condition.save();
 
-        // ─── Delay between conditions to avoid Gemini 429 ───
-        if (i < conditions.length - 1) {
-          await delay(3000);
-        }
+        // No delay needed — Groq has no rate limit issues
       }
 
       const elapsed = Date.now() - startTime;
@@ -288,10 +270,14 @@ const startPriceMonitor = () => {
       for (const userId of Object.keys(userMap)) {
         const { email, name, conditions } = userMap[userId];
 
-        // Delay before Gemini call
-        await delay(3000);
-
-        const aiCommentary = await getPortfolioCommentary(conditions);
+        // Get AI commentary for each condition using getMarketSummary
+        const summaryLines = await Promise.all(
+          conditions.map(async (c) => {
+            const commentary = await getMarketSummary(c.symbol, c.lastCheckedPrice || c.buyPrice);
+            return `${c.symbol}: ${commentary}`;
+          })
+        );
+        const aiCommentary = summaryLines.join('\n\n');
 
         const emailResult = await sendDailySummaryEmail({
           to: email,
